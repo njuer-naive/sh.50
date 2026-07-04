@@ -1,0 +1,2 @@
+﻿model,realized_variance_window,daily_theta,daily_phi,annualized_long_run_vol,variance_innovation_std
+Heston-style stochastic volatility,30,0.00011610173991615454,0.9905348003093485,0.1710486435458374,1.6501326693492276e-05
