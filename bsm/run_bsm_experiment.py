@@ -22,6 +22,7 @@ DATA_DIR = BASE_DIR / "data"
 OPTION_FILE = DATA_DIR / "50ETF_option_full_with_rf.csv"
 ETF_FILE = DATA_DIR / "510050_daily.csv"
 
+TARGET_OPTION_NAME_KEYWORD = "华夏上证50ETF期权"
 HISTORICAL_WINDOWS = [3, 5, 10, 30, 60]
 GARCH_SPECS = [(1, 1), (1, 2), (2, 1), (2, 2)]
 TRADING_DAYS = 252
@@ -127,6 +128,12 @@ def bsm_price(
 def load_and_prepare() -> tuple[pd.DataFrame, pd.DataFrame]:
     options = pd.read_csv(OPTION_FILE)
     etf = pd.read_csv(ETF_FILE)
+    raw_option_rows = len(options)
+    raw_contracts = options["ts_code"].nunique()
+    keyword_mask = options["name"].astype(str).str.contains(TARGET_OPTION_NAME_KEYWORD, regex=False, na=False)
+    options = options.loc[keyword_mask].copy()
+    keyword_option_rows = len(options)
+    keyword_contracts = options["ts_code"].nunique()
 
     options["trade_date"] = pd.to_datetime(options["trade_date"].astype(str), format="%Y%m%d")
     options["list_date"] = pd.to_datetime(options["list_date"].astype(str), format="%Y%m%d")
@@ -146,13 +153,14 @@ def load_and_prepare() -> tuple[pd.DataFrame, pd.DataFrame]:
         on="trade_date",
         how="left",
     )
-    merged = merged[
+    basic_filter_mask = (
         (merged["market_price"] > 0)
         & (merged["underlying_close"] > 0)
         & (merged["exercise_price"] > 0)
         & (merged["tau"] > 0)
         & merged["call_put"].isin(["C", "P"])
-    ].copy()
+    )
+    merged = merged[basic_filter_mask].copy()
     merged["moneyness"] = merged["underlying_close"] / merged["exercise_price"]
     merged["forecast_horizon_days"] = np.ceil(merged["days_to_maturity"] * TRADING_DAYS / CALENDAR_DAYS).clip(
         lower=1
@@ -190,7 +198,34 @@ def load_and_prepare() -> tuple[pd.DataFrame, pd.DataFrame]:
         ]
         write_csv(excluded[excluded_cols], BASE_DIR / "excluded_by_bsm_bounds.csv")
 
-    return merged.loc[valid_bounds].copy(), etf
+    usable = merged.loc[valid_bounds].copy()
+    filter_summary = pd.DataFrame(
+        [
+            {"stage": "raw_option_file", "rows": raw_option_rows, "contracts": raw_contracts},
+            {
+                "stage": "name_contains_huaxia_50etf_option",
+                "rows": keyword_option_rows,
+                "contracts": keyword_contracts,
+            },
+            {
+                "stage": "after_basic_price_maturity_filters",
+                "rows": len(merged),
+                "contracts": merged["ts_code"].nunique(),
+            },
+            {
+                "stage": "excluded_by_bsm_bounds",
+                "rows": len(excluded),
+                "contracts": excluded["ts_code"].nunique() if not excluded.empty else 0,
+            },
+            {
+                "stage": "final_pricing_sample",
+                "rows": len(usable),
+                "contracts": usable["ts_code"].nunique(),
+            },
+        ]
+    )
+    write_csv(filter_summary, BASE_DIR / "sample_filter_summary.csv")
+    return usable, etf
 
 
 def implied_volatility_vectorized(options: pd.DataFrame) -> np.ndarray:
@@ -264,14 +299,6 @@ def implied_volatility_vectorized(options: pd.DataFrame) -> np.ndarray:
 
 def add_implied_volatility(options: pd.DataFrame) -> pd.DataFrame:
     cache_file = BASE_DIR / "market_implied_volatility.csv"
-    if cache_file.exists():
-        iv = pd.read_csv(cache_file)
-        iv["trade_date"] = pd.to_datetime(iv["trade_date"])
-        keep = ["ts_code", "trade_date", "implied_vol"]
-        return options.merge(iv[keep], on=["ts_code", "trade_date"], how="left")
-
-    options = options.copy()
-    options["implied_vol"] = implied_volatility_vectorized(options)
     iv_cols = [
         "ts_code",
         "name",
@@ -285,6 +312,18 @@ def add_implied_volatility(options: pd.DataFrame) -> pd.DataFrame:
         "moneyness",
         "implied_vol",
     ]
+    if cache_file.exists():
+        iv = pd.read_csv(cache_file)
+        iv["trade_date"] = pd.to_datetime(iv["trade_date"])
+        keep = ["ts_code", "trade_date", "implied_vol"]
+        merged = options.merge(iv[keep], on=["ts_code", "trade_date"], how="left")
+        if merged["implied_vol"].isna().all():
+            merged["implied_vol"] = implied_volatility_vectorized(merged)
+        write_csv(merged[iv_cols], cache_file)
+        return merged
+
+    options = options.copy()
+    options["implied_vol"] = implied_volatility_vectorized(options)
     write_csv(
         options[iv_cols],
         cache_file,
@@ -668,64 +707,6 @@ def run_pricing_model(
     return metrics
 
 
-def write_report(summary: pd.DataFrame, options: pd.DataFrame) -> None:
-    valid_iv = int(options["implied_vol"].notna().sum())
-    total = int(len(options))
-    excluded_file = BASE_DIR / "excluded_by_bsm_bounds.csv"
-    excluded_count = len(pd.read_csv(excluded_file)) if excluded_file.exists() else 0
-    best_mae = summary.loc[summary["mae"].idxmin()]
-    best_rmse = summary.loc[summary["rmse"].idxmin()]
-    lines = [
-        "# 上证 50ETF 期权 BSM 定价实验",
-        "",
-        "## 一、实验目标",
-        "",
-        "本实验使用 Black-Scholes-Merton（BSM）模型对上证 50ETF 期权进行定价，并比较多种波动率输入对定价误差的影响。实验首先使用 3、5、10、30、60 个交易日的历史样本标准差估计年化波动率，随后加入多组 GARCH(p,q) 条件异方差模型和 Heston 风格的随机波动率模型，形成可复现实验管线。",
-        "",
-        "## 二、数据与样本处理",
-        "",
-        "- `bsm/data/50ETF_option_full_with_rf.csv`：期权合约日行情、行权价、剩余到期天数和对应无风险利率。",
-        "- `bsm/data/510050_daily.csv`：上证 50ETF 日行情，用于计算对数收益率和估计波动率。",
-        f"- 经过价格、标的价格、行权价和剩余期限等基础筛选后，可用于普通 BSM 框架的样本数为 `{total}`。",
-        f"- 因部分调整合约在缺少合约调整系数时会违反无股息 BSM 价格上下界，已将 `{excluded_count}` 条记录保存到 `excluded_by_bsm_bounds.csv`，不纳入误差比较。",
-        f"- 从市场价格反解得到的隐含波动率有效样本数为 `{valid_iv}`。",
-        "",
-        "## 三、实验方法",
-        "",
-        "1. 市场价格使用期权 `close` 字段；若收盘价缺失，则使用 `settle` 字段作为替代。",
-        "2. 到期时间使用 `days_to_maturity / 365`，无风险利率使用数据集中给出的 `rf_rate_decimal`。",
-        "3. 历史波动率模型使用 ETF 对数收益率的滚动样本标准差，并按 `sqrt(252)` 年化；样本均值同步输出，用于说明估计窗口内收益率水平。",
-        f"4. GARCH 模型使用 `arch` 包估计多组参数规格：{', '.join([f'GARCH({p},{q})' for p, q in GARCH_SPECS])}。对每个交易日，使用模型的多步条件方差预测，并根据期权剩余期限计算未来平均条件方差，再年化后代入 BSM 定价。",
-        "5. 随机波动率模型使用 30 日实现方差构造离散均值回复方差过程，形式上对应 Heston 方差过程的离散近似；定价时采用未来平均方差的条件期望作为 BSM 等效波动率。",
-        "6. 对所有模型输出 MAE、RMSE、Median AE、MAPE、SMAPE、带 0.01 价格下限的 MAPE、平均偏差和市场价格/模型价格相关系数。",
-        "",
-        "## 四、核心结果",
-        "",
-        summary.to_markdown(index=False, floatfmt=".6f"),
-        "",
-        f"- MAE 最低的模型为 `{best_mae['model']}`，MAE 为 `{best_mae['mae']:.6f}`。",
-        f"- RMSE 最低的模型为 `{best_rmse['model']}`，RMSE 为 `{best_rmse['rmse']:.6f}`。",
-        "- 原始 MAPE 对接近 0 的期权价格非常敏感，因此报告中同时给出 SMAPE 与设置 0.01 价格下限后的 MAPE。",
-        "",
-        "## 五、生成文件说明",
-        "",
-        "- `summary_metrics.csv`：所有波动率模型的总误差对比表。",
-        "- `market_implied_volatility.csv`：由市场期权价格反解得到的隐含波动率缓存，后续复现实验时可直接复用。",
-        "- `excluded_by_bsm_bounds.csv`：违反普通无股息 BSM 上下界、因缺少调整系数而未纳入比较的合约记录。",
-        "- `window_*d/`：不同历史波动率窗口的结果目录。",
-        "- `model_garch/`：基准 GARCH(1,1) 波动率预测与 BSM 定价结果。",
-        "- `model_garch_*_*/`：其他 GARCH(p,q) 参数组合的波动率预测与 BSM 定价结果，例如 `model_garch_1_2/`、`model_garch_2_1/`、`model_garch_2_2/`。",
-        "- `model_stochastic_volatility/`：随机波动率模型预测与 BSM 等效定价结果。",
-        "- 各模型目录中的 `pricing_results.csv` 保存逐条期权定价结果；`error_metrics.csv` 保存总体误差；`error_by_call_put.csv`、`error_by_maturity.csv`、`error_by_moneyness.csv` 分别按期权类型、期限和价内外程度分组。",
-        "- `volatility_time_series.(png|pdf)` 为市场隐含波动率与模型波动率的时间序列对比。",
-        "- `implied_vol_smile.(png|pdf)` 为最近交易日的隐含波动率微笑与模型波动率对比。",
-        "- `volatility_surface_3d.(png|pdf)` 为三维波动率曲面，横轴包含不同日期，纵轴为 moneyness，竖轴为年化波动率。",
-        "- `market_vs_model_price.(png|pdf)` 为市场价格与模型价格散点图；`mae_by_moneyness.(png|pdf)` 为不同 moneyness 区间的 MAE 柱状图。",
-        "",
-    ]
-    (BASE_DIR / "README.md").write_text("\n".join(lines), encoding="utf-8-sig")
-
-
 def main() -> None:
     apply_publication_style()
     options, etf = load_and_prepare()
@@ -776,7 +757,6 @@ def main() -> None:
 
     summary = pd.concat(all_metrics, ignore_index=True).sort_values("mae")
     write_csv(summary, BASE_DIR / "summary_metrics.csv")
-    write_report(summary, options)
     print(summary.to_string(index=False))
 
 
